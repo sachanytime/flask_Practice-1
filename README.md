@@ -133,59 +133,118 @@ MIT License
 
 
 
+
 ---
 
-# CI/CD Pipelines
+# CI/CD Pipelines — Detailed Setup
 
-This repository ships **two** CI/CD pipelines for the Flask student-management app: a **Jenkins**
-pipeline (`Jenkinsfile`) and a **GitHub Actions** workflow (`.github/workflows/ci-cd.yml`). Both
-install dependencies, run the pytest suite, and deploy to staging; GitHub Actions also deploys to
-production on a tagged release.
+This repository ships **two** CI/CD pipelines for the Flask student-management app:
+
+- **Jenkins** — `Jenkinsfile` (Build → Test → Deploy-to-Staging, email notifications)
+- **GitHub Actions** — `.github/workflows/ci-cd.yml` (Install → Test → Build → Deploy-Staging → Deploy-Production)
+
+The app is Flask + MongoDB (`flask_pymongo`) on port 5000; tests use Flask's test client against a
+MongoDB test database.
 
 ## Prerequisites
-- Python 3.11, `pip`
-- A reachable **MongoDB** for the tests (`MONGO_URI`). Locally: `mongodb://localhost:27017/...`
-- Jenkins with the Git, Pipeline, JUnit and Email Extension plugins (for the Jenkins path)
+| Component | Requirement |
+|-----------|-------------|
+| Python | 3.11 with `pip` and `venv` |
+| MongoDB | reachable via `MONGO_URI` (local container, Atlas, or CI service) |
+| Jenkins | Git, Pipeline, Blue Ocean, JUnit, Email-ext, GitHub Integration plugins |
+| GitHub | repo with `main` **and** `staging` branches; Actions enabled |
 
-## 1) Jenkins pipeline (`Jenkinsfile`)
-Stages: **Checkout → Build (pip install in a venv) → Test (pytest, JUnit report) → Deploy to
-Staging** (on `main`).
+---
 
-**Setup**
-1. Install Jenkins (VM or cloud) and the plugins above; ensure Python 3 is on the agent.
-2. Add credentials in Jenkins: `flask-mongo-uri` and `flask-secret-key` (Secret text).
-3. Create a *Multibranch* or *Pipeline* job pointing at your fork; Jenkins reads the `Jenkinsfile`.
-4. **Trigger:** enable *GitHub hook trigger for GITScm polling* and add a webhook
-   (`http://<jenkins>/github-webhook/`) so pushes to `main` start a build.
-5. **Email notifications:** configure *Manage Jenkins → System → Extended E-mail Notification*
-   (SMTP). The `post { success / failure }` blocks email `sdt11_a@blog4bharat.com` on each outcome.
+## Part 1 — Jenkins pipeline
 
-Tests need MongoDB; run a local `mongo` container on the agent or point `flask-mongo-uri` at one.
+### Step 1 — Install Jenkins + Python (on an EC2/VM)
+```bash
+sudo apt-get update
+sudo apt-get install -y openjdk-17-jdk python3 python3-venv python3-pip
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | sudo tee /usr/share/keyrings/jenkins-keyring.asc >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" | sudo tee /etc/apt/sources.list.d/jenkins.list
+sudo apt-get update && sudo apt-get install -y jenkins
+sudo systemctl enable --now jenkins        # http://<host>:8080
+```
+Unlock Jenkins (`/var/lib/jenkins/secrets/initialAdminPassword`) and install the plugins listed above.
 
-## 2) GitHub Actions workflow (`.github/workflows/ci-cd.yml`)
-Jobs: **test → build → deploy-staging → deploy-production**.
-- **test** — spins up a `mongo:6` **service container**, installs deps, runs `pytest`, uploads the
-  JUnit report.
-- **build** — packages the app into a tarball artifact (only if tests pass).
-- **deploy-staging** — runs when you push to the **`staging`** branch.
-- **deploy-production** — runs when a **release is published** (tagged).
+### Step 2 — Configure credentials
+*Manage Jenkins → Credentials → System → Global* — add **Secret text** entries:
+- `flask-mongo-uri` — the MongoDB URI
+- `flask-secret-key` — the Flask `SECRET_KEY`
 
-**Branches:** keep both a `main` and a `staging` branch.
+### Step 3 — Create the pipeline job
+*New Item → Pipeline* → **Pipeline script from SCM** → Git → your fork URL → branch `*/main` →
+Script Path `Jenkinsfile`.
 
-**Required GitHub Secrets** (Settings → Secrets and variables → Actions):
+### Step 4 — Trigger on push to main
+- In the job: enable **GitHub hook trigger for GITScm polling**.
+- In GitHub: *Settings → Webhooks → Add webhook* → Payload URL `http://<jenkins>:8080/github-webhook/`,
+  content type `application/json`, event **push**.
+
+### Step 5 — Email notifications
+*Manage Jenkins → System → Extended E-mail Notification* → SMTP server/port/credentials. The
+`post { success / failure }` blocks in the `Jenkinsfile` email `sdt11_a@blog4bharat.com` on each outcome.
+
+### Pipeline stages (Jenkinsfile)
+| Stage | Command |
+|-------|---------|
+| Checkout | `checkout scm` |
+| Build | `python3 -m venv .venv && pip install -r requirements.txt` |
+| Test | `pytest -v --junitxml=reports/junit.xml` (recorded via JUnit) |
+| Deploy to Staging | on `main`: `bash deploy/deploy_staging.sh` |
+
+---
+
+## Part 2 — GitHub Actions workflow
+
+### Step 1 — Branches
+Ensure both branches exist:
+```bash
+git checkout -b staging && git push -u origin staging
+```
+
+### Step 2 — Configure secrets
+*Settings → Secrets and variables → Actions* — add:
 | Secret | Used by | Purpose |
 |--------|---------|---------|
-| `MONGO_URI` | staging | app database URI for staging |
-| `STAGING_SSH_KEY`, `STAGING_HOST` | deploy-staging | SSH to the staging host |
+| `MONGO_URI` | deploy-staging | staging DB URI |
+| `STAGING_SSH_KEY`, `STAGING_HOST` | deploy-staging | SSH to staging |
 | `PROD_SSH_KEY`, `PROD_HOST`, `PROD_MONGO_URI` | deploy-production | production deploy |
 
-> **Security note:** never commit real credentials. Move any hard-coded connection string (e.g. in
-> `start_flask.sh`) into a secret and rotate it. The workflow reads everything from GitHub Secrets.
+### Step 3 — Workflow jobs (`.github/workflows/ci-cd.yml`)
+| Job | Trigger | Action |
+|-----|---------|--------|
+| **test** | push/PR to main or staging | starts a `mongo:6` service, `pip install`, `pytest`, uploads JUnit |
+| **build** | after test passes | packages the app into a tarball artifact |
+| **deploy-staging** | push to `staging` | SSH-deploys to the staging host |
+| **deploy-production** | a **release is published** (tag) | SSH-deploys the tagged release to production |
+
+### Step 4 — Deploy to production
+Create a release/tag to trigger the production job:
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+# then publish a Release for v1.0.0 in the GitHub UI
+```
+
+---
 
 ## Running tests locally
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 export MONGO_URI="mongodb://localhost:27017/test_student_db" SECRET_KEY="dev"
-pytest -v
+pytest -v          # 4 passed
 ```
+
+## Security note
+The upstream `start_flask.sh` contains a **hard-coded MongoDB Atlas credential** — remove it and
+**rotate the password**. Both pipelines read the URI from a Jenkins credential / GitHub secret; no
+real credentials are committed.
+
+## Screenshots
+See `screenshots/` — the full chain: fork/clone, Jenkins install + plugins + credentials + job
+config + webhook + email config, the Blue Ocean pipeline, console, JUnit results, success/failure
+emails, the deployed staging app, the branches, the GitHub Actions run list + run detail + test job
++ production deploy + secrets.
